@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,7 @@
 
 #define MAX_TOKENS 256
 #define BUF_SIZE   4096
+
 
 int readline(int fd, char *out, int maxlen) {
     int len = 0;
@@ -32,51 +34,40 @@ int readline(int fd, char *out, int maxlen) {
 }
 
 
+static char tok_buf[BUF_SIZE];          /* mutable copy of the line */
+static char tok_store[MAX_TOKENS][4];   /* storage for single-char tokens */
+
 int tokenize(char *line, char **tokens, int max) {
-    
+    /* strip comment */
     char *comment = strchr(line, '#');
     if (comment) *comment = '\0';
 
-    int count = 0;
-    char *p = line;
+    strncpy(tok_buf, line, BUF_SIZE - 1);
+    tok_buf[BUF_SIZE - 1] = '\0';
 
-    while (*p) {
-        
+    int count = 0;
+    char *p = tok_buf;
+
+    while (*p && count < max - 1) {
+        /* skip spaces */
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
 
-        if (count >= max - 1) {
-            fprintf(stderr, "mysh: too many tokens\n");
-            break;
-        }
-
-       
         if (*p == '|' || *p == '<' || *p == '>') {
-            tokens[count++] = p;   
+            /* single-char special token */
+            tok_store[count][0] = *p;
+            tok_store[count][1] = '\0';
+            tokens[count] = tok_store[count];
+            count++;
             p++;
-            *(p-1+1) = '\0';     
-            p--;   
-            tokens[count-1] = p;   
-            p++;
-            
-            if (*p == ' ' || *p == '\t' || *p == '\0') {
-                
-            } else {
-               
-                tokens[count-1][1] = '\0';
-                
-            }
-            continue;
+        } else {
+            /* regular word — ends at whitespace or special char */
+            tokens[count++] = p;
+            while (*p && *p != ' ' && *p != '\t' &&
+                   *p != '|' && *p != '<' && *p != '>') p++;
+            if (*p) *p++ = '\0';
         }
-
-        tokens[count++] = p;
-        while (*p && *p != ' ' && *p != '\t' &&
-               *p != '|' && *p != '<' && *p != '>') {
-            p++;
-        }
-        if (*p) *p++ = '\0';
     }
-
     tokens[count] = NULL;
     return count;
 }
@@ -147,8 +138,8 @@ int run_builtin(char **argv, int fd_out) {
 
 typedef struct {
     char *argv[MAX_TOKENS];
-    char *in_file;   /* < filename */
-    char *out_file;  /* > filename */
+    char *in_file;   
+    char *out_file;  
 } Cmd;
 
 
@@ -198,8 +189,8 @@ int parse_tokens(char **tokens, int ntok, Cmd *cmds, int max_cmds) {
 
 
 const char *resolve_path(const char *name) {
-    if (strchr(name, '/')) return name;   /*  Pathnames */
-    return find_program(name);            /* Bare names */
+    if (strchr(name, '/')) return name;   
+    return find_program(name);           
 }
 
 
@@ -214,12 +205,115 @@ void print_prompt(void) {
     fflush(stdout);
 }
 
+
 void print_status(int status) {
     if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
         printf("Exited with status %d\n", WEXITSTATUS(status));
     else if (WIFSIGNALED(status))
         psignal(WTERMSIG(status), "Terminated by signal");
 }
+
+
+int execute(Cmd *cmds, int ncmds, int interactive, int shell_fd) {
+    if (ncmds == 0) return 0;
+
+    /* single built-in — run directly in the shell */
+    if (ncmds == 1 && cmds[0].argv[0] && is_builtin(cmds[0].argv[0])) {
+        int saved_out = -1;
+        if (cmds[0].out_file) {
+            int f = open(cmds[0].out_file, O_WRONLY|O_CREAT|O_TRUNC, 0640);
+            if (f < 0) { perror(cmds[0].out_file); return 1; }
+            saved_out = dup(STDOUT_FILENO);
+            dup2(f, STDOUT_FILENO);
+            close(f);
+        }
+        int ret = run_builtin(cmds[0].argv, STDOUT_FILENO);
+        if (saved_out >= 0) { dup2(saved_out, STDOUT_FILENO); close(saved_out); }
+        return ret;
+    }
+
+    
+    int pipes[MAX_TOKENS][2];
+    for (int i = 0; i < ncmds - 1; i++) {
+        if (pipe(pipes[i]) < 0) { perror("pipe"); return 1; }
+    }
+
+    pid_t pids[MAX_TOKENS];
+
+    for (int i = 0; i < ncmds; i++) {
+        Cmd *c = &cmds[i];
+        if (!c->argv[0]) { fprintf(stderr, "mysh: empty command\n"); return 1; }
+
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 1; }
+
+        if (pid == 0) {
+            /* --- child --- */
+
+            
+            if (c->in_file) {
+                int f = open(c->in_file, O_RDONLY);
+                if (f < 0) { perror(c->in_file); exit(1); }
+                dup2(f, STDIN_FILENO); close(f);
+            } else if (i == 0 && !interactive) {
+                
+                int f = open("/dev/null", O_RDONLY);
+                if (f >= 0) { dup2(f, STDIN_FILENO); close(f); }
+            } else if (i > 0) {
+                
+                dup2(pipes[i-1][0], STDIN_FILENO);
+            }
+
+            /*  output redirection */
+            if (c->out_file) {
+                int f = open(c->out_file, O_WRONLY|O_CREAT|O_TRUNC, 0640);
+                if (f < 0) { perror(c->out_file); exit(1); }
+                dup2(f, STDOUT_FILENO); close(f);
+            } else if (i < ncmds - 1) {
+                /*  write to next pipe */
+                dup2(pipes[i][1], STDOUT_FILENO);
+            }
+
+            /* close all pipe fds in child */
+            for (int j = 0; j < ncmds - 1; j++) {
+                close(pipes[j][0]); close(pipes[j][1]);
+            }
+
+            /* built-in inside a pipeline */
+            if (is_builtin(c->argv[0])) {
+                int r = run_builtin(c->argv, STDOUT_FILENO);
+                exit(r == 0 ? 0 : 1);
+            }
+
+            /* find and exec the program */
+            const char *path = resolve_path(c->argv[0]);
+            if (!path) {
+                fprintf(stderr, "mysh: %s: not found\n", c->argv[0]);
+                exit(1);
+            }
+            execv(path, c->argv);
+            perror(c->argv[0]);
+            exit(1);
+        }
+
+        pids[i] = pid;
+    }
+
+    /* close pipe fds in parent */
+    for (int i = 0; i < ncmds - 1; i++) {
+        close(pipes[i][0]); close(pipes[i][1]);
+    }
+
+    /* wait for all children;  success = last command's exit status */
+    int last_status = 0;
+    for (int i = 0; i < ncmds; i++) {
+        int status;
+        waitpid(pids[i], &status, 0);
+        if (i == ncmds - 1) last_status = status;
+    }
+    return last_status;
+}
+
 
 int main(int argc, char *argv[]) {
     int fd;
@@ -231,7 +325,7 @@ int main(int argc, char *argv[]) {
         interactive = 0;
     } else if (argc == 1) {
         fd = STDIN_FILENO;
-        interactive = isatty(fd); /* §1: isatty() decides mode */
+        interactive = isatty(fd);  
     } else {
         fprintf(stderr, "Usage: mysh [script]\n");
         return EXIT_FAILURE;
@@ -244,21 +338,21 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         if (interactive) {
-            if (!first) print_status(last_status); /* §1: status before prompt */
-            print_prompt();                         /* §1: cwd prompt */
+            if (!first) print_status(last_status); 
+            print_prompt();                         
         }
         first = 0;
 
         char line[BUF_SIZE];
-        if (readline_fd(fd, line, sizeof(line)) < 0) break; /* EOF */
+        if (readline_fd(fd, line, sizeof(line)) < 0) break; 
 
         char *tokens[MAX_TOKENS];
         int ntok = tokenize(line, tokens, MAX_TOKENS);
-        if (ntok == 0) { last_status = 0; continue; } /* empty/comment line */
+        if (ntok == 0) { last_status = 0; continue; } 
 
         Cmd cmds[MAX_TOKENS];
         int ncmds = parse_tokens(tokens, ntok, cmds, MAX_TOKENS);
-        if (ncmds < 0) { last_status = 1; continue; } /* syntax error */
+        if (ncmds < 0) { last_status = 1; continue; } 
 
         /* check if any segment is "exit" */
         int has_exit = 0;
@@ -267,12 +361,12 @@ int main(int argc, char *argv[]) {
                 has_exit = 1;
 
         int result = execute(cmds, ncmds, interactive, fd);
-        if (result == -999 || has_exit) break; /* §2.2: exit command */
+        if (result == -999 || has_exit) break; 
 
         last_status = result;
     }
 
-    if (interactive) printf("Exiting my shell.\n"); /* §1: goodbye */
+    if (interactive) printf("Exiting my shell.\n");  
     if (fd != STDIN_FILENO) close(fd);
-    return EXIT_SUCCESS; /* §2.1: mysh always exits EXIT_SUCCESS */
+    return EXIT_SUCCESS; /* mysh always exits EXIT_SUCCESS */
 }
