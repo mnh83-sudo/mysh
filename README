@@ -1,0 +1,95 @@
+CS 214 Spring 2026 - Project III: mysh
+=======================================
+Name: Numair Hasan, Darren Chuang
+NetID: MNH83, dlc286
+
+
+Overview
+--------
+mysh is a simple Unix shell that supports interactive and batch modes,
+built-in commands, I/O redirection, pipelines, and glob expansion.
+
+
+Building
+--------
+    make
+
+This produces the executable ./mysh.
+
+Usage
+-----
+    ./mysh              # interactive mode if stdin is a terminal
+    ./mysh script.sh    # batch mode from a file
+    cat script.sh | ./mysh  # batch mode from a pipe
+
+
+Features Implemented
+--------------------
+- readline() using read() one byte at a time, no buffered I/O
+- Tokenizer that handles whitespace, #comments, and |, <, > as solo tokens
+- Interactive mode: prompt showing current directory with ~ for HOME,
+  welcome/goodbye messages, exit status reporting after each command
+- Batch mode: no prompt or messages, child stdin defaults to /dev/null
+- Built-in commands: cd, pwd, which, exit
+- Program search in /usr/local/bin, /usr/bin, /bin (in that order)
+- Direct path execution when name contains /
+- I/O redirection with < and >
+- Pipelines with | connecting multiple sub-commands
+- Glob/wildcard expansion for tokens containing *
+  - Patterns starting with * do not match hidden (dot) files
+  - Unmatched patterns passed through unchanged
+- exit works inside pipelines (e.g. foo | exit)
+
+
+Test Plan
+---------
+
+1. readline / tokenize
+   - Empty line -> no tokens, shell continues
+   - Line with only a comment: "# hello" -> no tokens
+   - Mixed: "echo hi # comment" -> 2 tokens: echo, hi
+   - Special chars as tokens: "echo foo > bar" -> 4 tokens
+
+2. Built-ins
+   - pwd: prints working directory
+   - cd with no args: goes to $HOME
+   - cd subdir: changes into subdir, prompt updates
+   - cd too_many args: prints error
+   - cd nonexistent: prints error from chdir
+   - which ls: prints /bin/ls
+   - which cd: prints nothing (cd is a builtin)
+   - which fakecmd: prints nothing
+   - exit: prints goodbye and quits
+
+3. External programs
+   - echo hello world: runs /bin/echo, prints output
+   - /bin/ls: direct path works
+   - fakecmd: prints "not found" error
+
+4. Redirection
+   - echo hello > out.txt: creates file with "hello"
+   - cat < out.txt: reads from file
+   - echo hi > out.txt < /dev/null: both redirects on one command
+
+5. Pipelines
+   - echo hello | cat: output flows through pipe
+   - ls | grep mysh | cat: multi-stage pipeline
+   - last command's exit status reported
+
+6. Wildcards
+   - ls *.c: expands to all .c files
+   - ls *.txt with no matches: passes *.txt literally
+   - *.c does not match .hidden.c
+
+7. Interactive vs batch
+   - ./mysh < script.sh: no prompt printed
+   - ./mysh script.sh: same
+   - ./mysh in terminal: prompt shown, status shown after errors
+
+8. Exit status reporting
+   - false (exits 1): prints "Exited with status 1"
+   - kill -TERM $$: prints "Terminated by signal ..."
+
+Test inputs used
+----------------
+See test_basic.sh and test_pipes.sh in this archive.
